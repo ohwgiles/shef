@@ -1,0 +1,452 @@
+#!/bin/bash
+
+if [[ -z "$SERVER_SOFTWARE" ]]; then
+	# Assume we were invoked directly: exec lighttpd to be our http server
+	cd "$(dirname "${BASH_SOURCE[0]}")"
+	conf=$(mktemp)
+	trap "rm -f $conf" EXIT
+	cat > $conf <<-\EOF
+		server.document-root = var.CWD + "/notes/"
+		server.port = "8080"
+		server.modules = ( "mod_cgi", "mod_rewrite" )
+		mimetype.assign   = ( ".jpg"  => "image/jpeg" )
+		$HTTP["request-method"] != "GET" {
+		  url.rewrite-once = ( "" => "/" )
+		}
+		$HTTP["url"] !~ ".jpg$" {
+		  url.rewrite-once = ( "" => "/" )
+		}
+		$HTTP["url"] == "/" {
+		  server.document-root = var.CWD
+		  index-file.names = ( "shef" )
+		  cgi.assign = ( "shef" => "" )
+		}
+	EOF
+	lighttpd -Df $conf
+	exit
+fi
+
+# Otherwise, we are a CGI script!
+NOTES_DIR="$(dirname "${BASH_SOURCE[0]}")/notes"
+mkdir -p "$NOTES_DIR"
+cd "$NOTES_DIR"
+if [[ ! -d .git ]] && ! git init &> /dev/null; then
+  echo "shef: Could not initialize git repository in $PWD" >/dev/stderr
+  echo -e 'Status: 500 Server Error\n\n'
+  exit
+fi
+
+echo "shef: $REQUEST_METHOD $REQUEST_URI $CONTENT_TYPE" >/dev/stderr
+
+function urldecode() { local v="${*//+/ }"; echo -e "${v//%/\\x}"; }
+shopt -s extglob
+
+if [[ "$REQUEST_METHOD" == "PUT" ]]; then
+  if [[ "$CONTENT_TYPE" == "text/plain" ]]; then
+    ext="txt"
+  elif [[ "$CONTENT_TYPE" == "image/jpeg" ]]; then
+    ext="jpg"
+  else
+    echo -e 'Status: 400 Bad Request\n\n{}'
+    exit
+  fi
+  echo 'attempt to put' >/dev/stderr
+  out=$(urldecode "$REQUEST_URI")
+  out=${out##*(/)}
+  if [[ -n $out ]] && dd of="$out.$ext" status=none; then
+    echo -e 'Status: 200 OK\n\n{}'
+  else
+    echo -e 'Status: 400 Bad Request\n\n{}'
+  fi
+  exit
+fi
+
+# Main data request
+if [[ "$REQUEST_URI" == "/data.json" ]]; then
+	# Output all notes in the format
+	# { filename: contents, ... }
+	result='{}'
+	for f in *.txt; do
+		f=${f%%.txt}
+		result=$(jq -s "$result * .[0]" <(jq -s "{\"$f\": .[0]}" <(jq -sR . "$f.txt")));
+	done
+	# To test unreachability:
+	#echo -e "Status: 400 Bad Request\n\n"
+	echo -e 'Status: 200 OK\nContent-type: application/json; charset=utf-8\n\n'
+	echo "$result"
+	exit
+fi
+
+# Application manifest
+if [[ "$REQUEST_URI" == "/manifest.webmanifest" ]]; then
+cat <<\EOF
+Status: 200 OK
+Content-type: application/manifest+json
+
+{
+  "name": "Shef",
+  "short_name": "Shef",
+  "description": "Recipe/notes store.",
+  "display": "standalone",
+  "background_color": "#333333",
+  "scope": "/"
+}
+EOF
+exit
+fi
+
+# Icon
+if [[ "$REQUEST_URI" == "/icon.png" ]]; then
+cat <<EOF
+Status: 200 OK
+Content-type: image/png
+
+EOF
+rsvg-convert -w 180 -h 180 <(cat <<EOF
+<svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+ <rect width="100" height="100" fill="#333333" />
+ <text x="30" y="75" fill="white" font-family="sans-serif" font-size="18">#!shef</text>
+</svg>
+EOF
+)
+exit
+fi
+
+# Service worker
+if [[ "$REQUEST_URI" == "/sw.js" ]]; then
+cat <<\EOF
+Status: 200 OK
+Content-type: application/javascript; charset=utf-8
+
+self.addEventListener("fetch", event => {
+  event.respondWith(caches.open('shef').then(cache => {
+    return fetch(event.request).then(resp => {
+      cache.put(event.request, resp.clone());
+      return resp;
+    }).catch(err => {
+      return cache.match(event.request);
+    });
+  }));
+});
+EOF
+exit
+fi
+
+# Main page
+if [[ "$REQUEST_URI" == "/" ]]; then
+cat <<\EOF
+Status: 200 OK
+Content-type: text/html; charset=utf-8
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+ <meta charset="utf-8">
+ <link rel="manifest" href="/manifest.webmanifest">
+ <meta name="viewport" content="width=device-width, initial-scale=1">
+ <link rel="apple-touch-icon" href="/icon.png">
+ <title>Shef</title>
+ <style>
+  body {
+   font-family: Helvetica, Arial, sans-serif;
+   margin: 0;
+   background-color: #333;
+   color: #222;
+   font-size: x-large;
+  }
+  #status {
+    background-color: #80519e;
+    text-align: center;
+    color: white;
+    padding: 5px;
+    display: none;
+  }
+  #notes {
+   display: flex;
+   flex-wrap: wrap;
+  }
+  .note {
+   position: relative;
+   cursor: pointer;
+   flex-grow: 1;
+   height: 20vh;
+  }
+  .note img {
+   object-fit: cover;
+   min-width: 100%;
+   max-height: 100%;
+  }
+  .note span {
+   position: absolute;
+   left: 0;
+   bottom: 0;
+   margin: 10px;
+   color: white;
+   font-size: 28px;
+   font-weight: bold;
+   -webkit-text-stroke: 1px black;
+  }
+  #detail {
+   background-color: white;
+   position: absolute;
+   top: 0;
+   width: 100vw;
+   overflow: auto;
+   margin-top: 100vh;
+   height: 0;
+   transition: margin-top 400ms ease, height 400ms ease;
+  }
+  #detail.shown {
+   height: 100%;
+   margin-top: 0;
+  }
+  #detail>div {
+   display: flex;
+   margin: 10px;
+  }
+  #detail-title {
+   flex-grow: 1;
+   font-size: xx-large;
+   color: #555;
+  }
+  #detail-content {
+    white-space: pre-wrap;
+  }
+  .icon {
+   font-size: xx-large;
+   color: #aaa;
+   cursor: pointer;
+  }
+  .icon:hover { color: #777; }
+  .icon.edit, .icon.save { display: none; }
+  .icon.image {  }
+  .icon.add {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    margin: 1em;
+    display: grid;
+    place-content: center;
+    border-radius: 1.3em;
+    height: 1.3em;
+    width: 1.3em;
+    color: white;
+    background-color: #2196F3;
+  }
+ </style>
+</head>
+<body>
+ <div id="status"></div>
+ <div id="notes"></div>
+ <span class="icon add">&#x2795;&#xfe0e;</span>
+ <div id="detail">
+  <div>
+   <div id="detail-title"></div>
+   <span class="icon image">&#x1f5bc;&#xfe0e;</span>
+   <span class="icon edit">&#x1F589;&#xfe0e;</span>
+   <span class="icon save">&#x1F5AB;&#xfe0e;</span>
+   <span class="icon close">&#x274C;&#xfe0e;</span>
+  </div>
+  <div id="detail-content" dir="auto"></div>
+ </div>
+ <form><input id="upload" type="file" accept="image/*" hidden>
+ <script>
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js");
+  }
+  
+  const statusMessage = msg => {
+    const status = document.querySelector('#status');
+    if(msg) {
+      status.style.display = 'block';
+      status.innerText = msg;
+    } else {
+      status.style.display = 'none';
+    }
+  }
+
+  document.body.onload = () => {
+    const appSetup = data => {
+      localStorage.setItem('content', JSON.stringify(data));
+      const modifications = JSON.parse(localStorage.getItem('modifications') || '{}');
+      const images = JSON.parse(localStorage.getItem('images') || '{}');
+      const rq = indexedDB.open('shef', 1);
+      rq.onupgradeneeded = event => {
+        event.target.result.createObjectStore('images');
+      }
+      let db;
+      rq.onsuccess = event => {
+        db = event.target.result;
+      }
+      
+      const allowEdits = true;
+      const notes = document.querySelector('#notes');
+      const detail = document.querySelector('#detail');
+      const content = document.querySelector('#detail-content');
+      const title = document.querySelector('#detail-title');
+      const close = document.querySelector('.icon.close');
+      const edit = document.querySelector('.icon.edit');
+      const save = document.querySelector('.icon.save');
+      const add = document.querySelector('.icon.add');
+      const image = document.querySelector('.icon.image');
+      const upload = document.querySelector('#upload');
+      let active, newImage;
+      
+      const storeChanges = () => {
+        const checkAllSaved = () => {
+          if(Object.keys(modifications).length == 0 && Object.keys(images).length == 0) {
+            statusMessage(null);
+          }
+        }
+        Object.entries(modifications).forEach(([title,content]) => {
+          fetch(window.location.href + title, {
+            method: 'PUT',
+            headers: {
+              'Content-type': 'text/plain'
+            },
+            body: content
+          }).then(resp => resp.json()).then(resp => {
+            data[title] = content;
+            localStorage.setItem('content', JSON.stringify(data));
+            delete modifications[title];
+            localStorage.setItem('modifications', JSON.stringify(modifications));
+            checkAllSaved();
+          }).catch(error => {
+            console.error(error);
+          });
+        });
+        Object.entries(images).forEach(([title,content]) => {
+          fetch(content).then(res => res.blob()).then(blob => {
+            fetch(window.location.href + title, {
+              method: 'PUT',
+              headers: {
+                'Content-type': 'image/jpeg'
+              },
+              body: new File([blob], title + '.jpg', { type: 'image/jpeg' })
+            }).then(resp => resp.json()).then(resp => {
+              delete images[title];
+              localStorage.setItem('images', JSON.stringify(images));
+              checkAllSaved();
+            }).catch(error => {
+              console.error(error);
+            });
+          }).catch(error => {
+            console.error(error);
+          });
+        });
+      }
+
+      if(Object.keys(modifications).length > 0 || Object.keys(images).length > 0) {
+        statusMessage('Unsynchronized changes');
+        storeChanges();
+      }
+      close.onclick = () => {
+        edit.style.display = 'block';
+        save.style.display = 'none';
+        content.contentEditable = false;
+        title.contentEditable = false;
+        detail.classList.remove('shown');
+        newImage = null;
+      };
+      edit.style.display = allowEdits ? 'block' : 'none';
+      edit.onclick = () => {
+        content.contentEditable = true;
+        edit.style.display = 'none';
+        save.style.display = 'block';
+      };
+      upload.onchange = e => {
+        const fr = new FileReader();
+        fr.onload = () => {
+          const img = document.createElement('img');
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            const scale = 0.2;
+            canvas.width = img.width * scale;
+            canvas.height = img.height * scale;
+            canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+            canvas.toBlob(blob => {
+              newImage = blob;
+              const tx = db.transaction(['images'], 'readwrite');
+              tx.objectStore('images').put(blob, title.innerText);
+              const fr = new FileReader(); // todo try objecturl instead
+              fr.onload = () => {
+                          active.querySelector('img').src = fr.result;
+            newImage = fr.result;
+            edit.style.display = 'none';
+            save.style.display = 'block';
+
+              }
+              fr.readAsDataURL(blob);
+              
+            }, 'image/jpeg');
+          }
+                  img.src = fr.result;
+
+        }
+                      fr.readAsDataURL(e.target.files[0]);
+
+        
+        
+      }
+      image.onclick = () => {
+        upload.click();
+      }
+      save.onclick = () => {
+        modifications[title.innerText] = content.innerText;
+        localStorage.setItem('modifications', JSON.stringify(modifications));
+        if(newImage) {
+          images[title.innerText] = newImage;
+          localStorage.setItem('images', JSON.stringify(images));
+        }
+        statusMessage('Unsynchronized changes');
+        storeChanges();
+        close.click();
+      }
+      add.onclick = () => {
+        detail.classList.add('shown');
+        content.innerHTML = "";
+        title.innerText = "";
+        title.contentEditable = true;
+        title.focus();
+        edit.click();
+      }
+      Object.entries(data).forEach(([name,data]) => {
+        const div = document.createElement('div');
+        div.classList.add('note');
+        if(images.hasOwnProperty(name))
+          div.innerHTML += `<img src="${images[name]}"><span>${name}</span>`;
+        else
+          div.innerHTML += `<img src="${name}.jpg"><span>${name}</span>`;
+        div.onclick = () => {
+          active = div;
+          if(modifications.hasOwnProperty(name))
+            data = modifications[name];
+          content.innerHTML = data;
+          title.innerText = name;
+          detail.classList.add('shown');
+        }
+        notes.appendChild(div);
+      });
+    }
+    // get content from server
+    fetch(window.location.href + 'data.json')
+    .then(resp => resp.json()).then(data => {
+      console.log('setup from server');
+      appSetup(data);
+    }).catch(error => {
+      // ? can never happen if serviceworker loaded?
+      statusMessage(error);
+      console.error(error);
+      console.log('setup from localstorage');
+      const data = localStorage.getItem('content');
+      appSetup(data === null ? {} : JSON.parse(data));
+    })
+  }
+ </script>
+</body>
+</html>
+EOF
+exit
+fi
+
+echo -e 'Status: 404 Not Found\n\n'
