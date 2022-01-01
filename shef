@@ -7,53 +7,59 @@ if [[ -z "$SERVER_SOFTWARE" ]]; then
 	trap "rm -f $conf" EXIT
 	cat > $conf <<-\EOF
 		server.document-root = var.CWD + "/notes/"
-		server.port = "8080"
+		server.port = "4431"
 		server.modules = ( "mod_cgi", "mod_rewrite" )
-		mimetype.assign   = ( ".jpg"  => "image/jpeg" )
+		mimetype.assign = (
+		".jpg"  => "image/jpeg",
+		".txt" => "text/plain" )
 		$HTTP["request-method"] != "GET" {
-		  url.rewrite-once = ( "" => "/" )
+			url.rewrite-once = ( "" => "/" )
 		}
-		$HTTP["url"] !~ ".jpg$" {
-		  url.rewrite-once = ( "" => "/" )
+		$HTTP["url"] !~ "\.(jpg|txt)$" {
+		# jpgs and txts served directly by lighttpd, other requests redirected to shef
+			url.rewrite-once = ( "" => "/${qsa}" )
 		}
 		$HTTP["url"] == "/" {
-		  server.document-root = var.CWD
-		  index-file.names = ( "shef" )
-		  cgi.assign = ( "shef" => "" )
+			server.document-root = var.CWD
+			index-file.names = ( "shef" )
+			cgi.assign = ( "shef" => "" )
+		}
+		# SSL
+		server.modules += ( "mod_openssl" )
+		$SERVER["socket"] == ":4431" {
+			ssl.engine = "enable"
+			ssl.pemfile = var.CWD + "/server-chain.pem"
 		}
 	EOF
-	lighttpd -Df $conf
+	/usr/sbin/lighttpd -Df $conf
 	exit
 fi
 
 # Otherwise, we are a CGI script!
+# Set up the git dir to store the notes
 NOTES_DIR="$(dirname "${BASH_SOURCE[0]}")/notes"
 mkdir -p "$NOTES_DIR"
 cd "$NOTES_DIR"
-if [[ ! -d .git ]] && ! git init &> /dev/null; then
+if [[ ! -d .git ]] && ! { git init &> /dev/null && \
+  git config user.name shef && \
+  git config user.email shef@localhost; }
+then
   echo "shef: Could not initialize git repository in $PWD" >/dev/stderr
   echo -e 'Status: 500 Server Error\n\n'
   exit
 fi
 
 echo "shef: $REQUEST_METHOD $REQUEST_URI $CONTENT_TYPE" >/dev/stderr
-
+#env >/dev/stderr
 function urldecode() { local v="${*//+/ }"; echo -e "${v//%/\\x}"; }
 shopt -s extglob
 
 if [[ "$REQUEST_METHOD" == "PUT" ]]; then
-  if [[ "$CONTENT_TYPE" == "text/plain" ]]; then
-    ext="txt"
-  elif [[ "$CONTENT_TYPE" == "image/jpeg" ]]; then
-    ext="jpg"
-  else
-    echo -e 'Status: 400 Bad Request\n\n{}'
-    exit
-  fi
-  echo 'attempt to put' >/dev/stderr
   out=$(urldecode "$REQUEST_URI")
   out=${out##*(/)}
-  if [[ -n $out ]] && dd of="$out.$ext" status=none; then
+  if [[ -n $out ]] && cat >"$out" && flock .git bash -ec \
+    "git add \"$out\" && git commit -m\"Update from $REMOTE_ADDR\" -m\"$HTTP_USER_AGENT\""
+  then
     echo -e 'Status: 200 OK\n\n{}'
   else
     echo -e 'Status: 400 Bad Request\n\n{}'
@@ -88,6 +94,7 @@ Content-type: application/manifest+json
   "short_name": "Shef",
   "description": "Recipe/notes store.",
   "display": "standalone",
+  "orientation":"portrait",
   "background_color": "#333333",
   "scope": "/"
 }
@@ -118,17 +125,40 @@ cat <<\EOF
 Status: 200 OK
 Content-type: application/javascript; charset=utf-8
 
-self.addEventListener("fetch", event => {
-  event.respondWith(caches.open('shef').then(cache => {
-    return fetch(event.request).then(resp => {
-      cache.put(event.request, resp.clone());
-      return resp;
-    }).catch(err => {
-      return cache.match(event.request);
-    });
-  }));
+self.addEventListener('fetch', (event) => {
+  const path = event.request.url.substring(self.location.origin.length);
+  if(!path.startsWith("/sync?") && event.request.method == 'GET') {
+    event.respondWith(
+      caches.match(event.request).then((resp) => {
+        return resp || fetch(event.request).then((response) => {
+          return caches.open('shef').then((cache) => {
+            cache.put(event.request, response.clone());
+            return response;
+          });
+        });
+      })
+    );
+  }
 });
 EOF
+exit
+fi
+
+# Fetch server-side changes
+if [[ "$REQUEST_URI" == "/sync?$QUERY_STRING" ]]; then
+IFS== read _ from <<<$QUERY_STRING
+cat <<EOF
+Status: 200 OK
+Content-type: application/json; charset=utf-8
+
+EOF
+(git rev-parse --verify -q --end-of-options "$from" &>/dev/null && \
+  git diff $from..HEAD --summary --name-status | xargs -r printf '%b\t%b\n' |
+   jq -Rn 'reduce (inputs|split("\t")) as $i ({}; .[$i[0]] += [$i[1]])|
+    {"created":(.A//[]),"modified":(.M//[]),"deleted":(.D//[])}' ||
+  git ls-files | xargs -r printf '%b\n' | \
+   jq -Rn '{"created":[inputs],"modified":[],"deleted":[]}') |
+jq "{ \"head\": \"$(git rev-parse --verify -q HEAD)\"} * ."
 exit
 fi
 
@@ -147,302 +177,216 @@ Content-type: text/html; charset=utf-8
  <link rel="apple-touch-icon" href="/icon.png">
  <title>Shef</title>
  <style>
-  body {
-   font-family: Helvetica, Arial, sans-serif;
-   margin: 0;
-   background-color: #333;
-   color: #222;
-   font-size: x-large;
-  }
-  #status {
-    background-color: #80519e;
-    text-align: center;
-    color: white;
-    padding: 5px;
-    display: none;
-  }
-  #notes {
-   display: flex;
-   flex-wrap: wrap;
-  }
-  .note {
-   position: relative;
-   cursor: pointer;
-   flex-grow: 1;
-   height: 20vh;
-  }
-  .note img {
-   object-fit: cover;
-   min-width: 100%;
-   max-height: 100%;
-  }
-  .note span {
-   position: absolute;
-   left: 0;
-   bottom: 0;
-   margin: 10px;
-   color: white;
-   font-size: 28px;
-   font-weight: bold;
-   -webkit-text-stroke: 1px black;
-  }
-  #detail {
-   background-color: white;
-   position: absolute;
-   top: 0;
-   width: 100vw;
-   overflow: auto;
-   margin-top: 100vh;
-   height: 0;
-   transition: margin-top 400ms ease, height 400ms ease;
-  }
-  #detail.shown {
-   height: 100%;
-   margin-top: 0;
-  }
-  #detail>div {
-   display: flex;
-   margin: 10px;
-  }
-  #detail-title {
-   flex-grow: 1;
-   font-size: xx-large;
-   color: #555;
-  }
-  #detail-content {
-    white-space: pre-wrap;
-  }
-  .icon {
-   font-size: xx-large;
-   color: #aaa;
-   cursor: pointer;
-  }
+  body { font-family: 'SF Pro', Helvetica, Arial, sans-serif; margin: 0; background-color: #333; color: #222; font-size: x-large; }
+  #notes { display: flex; flex-wrap: wrap; }
+  .note { position: relative; cursor: pointer; flex-grow: 1; height: 20vh; min-width: 100px; display: flex; }
+  .note img { object-fit: cover; min-width: 100%; max-height: 100%; }
+  .note span { position: absolute; left: 0; bottom: 0; right: 0; top: 0; padding: 10px;
+               overflow: hidden; display: flex; align-items: flex-end; color: white;
+               font-size: 28px; font-weight: bold; -webkit-text-stroke: 1px black; }
+  #detail { background-color: white; position: fixed; top: 0; width: 100vw; overflow: auto;
+            margin-top: 100vh; height: 0; transition: margin-top 400ms ease, height 400ms ease;
+            display: flex; flex-direction: column; touch-action: none; }
+  #detail.shown { height: 100%; margin-top: 0; }
+  #detail>div { display: flex; padding: 10px; gap: 10px; }
+  #detail-toolbar { border-bottom: 1px solid lightgray; color: gray; }
+  #detail-title { font-size: xx-large; color: #555; border-bottom: 1px solid lightgray; }
+  #detail-content { padding: 10px; font-family: inherit; font-size: inherit; border: none; outline: none; flex-grow: 1; }
+  .icon { padding: 5px; color: #aaa; cursor: pointer; }
   .icon:hover { color: #777; }
-  .icon.edit, .icon.save { display: none; }
-  .icon.image {  }
-  .icon.add {
-    position: absolute;
-    right: 0;
-    bottom: 0;
-    margin: 1em;
-    display: grid;
-    place-content: center;
-    border-radius: 1.3em;
-    height: 1.3em;
-    width: 1.3em;
-    color: white;
-    background-color: #2196F3;
-  }
+  .icon.add { position: fixed; right: 0; bottom: 0; margin: 1em; display: grid; place-content: center;
+              border-radius: 1.3em; height: 1.3em; width: 1.3em; color: white; background-color: #2196F3; }
+  .action { font-size: x-large; cursor: pointer; }
+  .action.save { display: none; }
  </style>
 </head>
 <body>
- <div id="status"></div>
  <div id="notes"></div>
  <span class="icon add">&#x2795;&#xfe0e;</span>
  <div id="detail">
-  <div>
-   <div id="detail-title"></div>
-   <span class="icon image">&#x1f5bc;&#xfe0e;</span>
-   <span class="icon edit">&#x1F589;&#xfe0e;</span>
-   <span class="icon save">&#x1F5AB;&#xfe0e;</span>
-   <span class="icon close">&#x274C;&#xfe0e;</span>
+  <div id="detail-toolbar">
+   <span class="action image">Image</span>
+   <span class="action edit">Edit</span>
+   <span class="action save">Save</span>
+   <span style="flex-grow: 1"></span>
+   <span class="action close">Close</span>
   </div>
-  <div id="detail-content" dir="auto"></div>
+  <div id="detail-title" dir="auto"></div>
+  <textarea id="detail-content" dir="auto" readonly="true"></textarea>
  </div>
  <form><input id="upload" type="file" accept="image/*" hidden>
- <script>
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("sw.js");
-  }
+<script>
+
+function checkForServerChanges() {
+  const head = localStorage.getItem('head');
+  fetch(`/sync?head=${head}`).then(resp => resp.json()).then(resp => {
+    const paths = []
+       .concat(resp.created)
+       .concat(resp.modified)
+       .concat(resp.deleted);
+    if(paths.length == 0)
+      return;
+    caches.open('shef')
+      .then(cache => Promise.all(paths.map(path => cache.delete(new Request(path)))))
+      .then(() => Promise.all(paths.map(path => fetch(path)))) // re-populate cache
+      .then(() =>
+    {
+      // update list of known notes
+      localStorage.setItem('entries', JSON.stringify(
+        JSON.parse(localStorage.getItem('entries') || '[]')
+          .filter(entry => !resp.deleted.includes(`${entry}.txt`))
+          .concat(resp.created.filter(e => e.endsWith('.txt')).map(e => e.slice(0, -4)))
+      ));
+      localStorage.setItem('head', resp.head);
+      location.reload(); // TODO: more gently
+    });
+  });
+}
+
+function storeLocalChanges() {
+  const changedPaths = JSON.parse(localStorage.getItem('changedPaths') || '[]');
+  return caches.open('shef').then(cache => 
+    Promise.all(changedPaths.map(path =>
+      cache.match(new Request(path)).then(resp => {
+        const put = (contentType, body) => fetch(path, {
+          method: 'PUT',
+          headers: { 'Content-type': contentType },
+          body: body
+        });
+        return ({
+          ".txt": () => resp.text().then(txt => put('text/plain', txt)),
+          ".jpg": () => resp.blob().then(blob => put('image/jpeg', blob))
+        })[path.slice(-4)]();
+      }).then(() => changedPaths.splice(changedPaths.indexOf(path), 1))
+    )).then(() => localStorage.setItem('changedPaths', JSON.stringify(changedPaths)))
+  );
+}
+
+function pathChanged(path) {
+  const changed = JSON.parse(localStorage.getItem('changedPaths') || '[]');
+  if(changed.indexOf(path) == -1)
+    localStorage.setItem('changedPaths', JSON.stringify(changed.concat(path)));
+}
+
+const dom = {
+  notes: document.querySelector('#notes'),
+  detail: document.querySelector('#detail'),
+  content: document.querySelector('#detail-content'),
+  title: document.querySelector('#detail-title'),
+  close: document.querySelector('.action.close'),
+  edit: document.querySelector('.action.edit'),
+  save: document.querySelector('.action.save'),
+  image: document.querySelector('.action.image'),
+  add: document.querySelector('.icon.add'),
+  upload: document.querySelector('#upload'),
+};
   
-  const statusMessage = msg => {
-    const status = document.querySelector('#status');
-    if(msg) {
-      status.style.display = 'block';
-      status.innerText = msg;
-    } else {
-      status.style.display = 'none';
-    }
-  }
+dom.close.onclick = function() {
+  dom.edit.style.display = 'block';
+  dom.save.style.display = 'none';
+  dom.content.readOnly = true;
+  dom.title.contentEditable = false;
+  dom.detail.classList.remove('shown');
+  localStorage.removeItem('active');
+};
 
-  document.body.onload = () => {
-    const appSetup = data => {
-      localStorage.setItem('content', JSON.stringify(data));
-      const modifications = JSON.parse(localStorage.getItem('modifications') || '{}');
-      const images = JSON.parse(localStorage.getItem('images') || '{}');
-      const rq = indexedDB.open('shef', 1);
-      rq.onupgradeneeded = event => {
-        event.target.result.createObjectStore('images');
-      }
-      let db;
-      rq.onsuccess = event => {
-        db = event.target.result;
-      }
+dom.edit.onclick = function() {
+  dom.content.readOnly = false;
+  dom.edit.style.display = 'none';
+  dom.save.style.display = 'block';
+};
       
-      const allowEdits = true;
-      const notes = document.querySelector('#notes');
-      const detail = document.querySelector('#detail');
-      const content = document.querySelector('#detail-content');
-      const title = document.querySelector('#detail-title');
-      const close = document.querySelector('.icon.close');
-      const edit = document.querySelector('.icon.edit');
-      const save = document.querySelector('.icon.save');
-      const add = document.querySelector('.icon.add');
-      const image = document.querySelector('.icon.image');
-      const upload = document.querySelector('#upload');
-      let active, newImage;
+dom.save.onclick = function() {
+  const name = dom.title.innerText;
+  const content = dom.content.value;
+  caches.open('shef')
+    .then(cache => cache.put(new Request(`${name}.txt`), new Response(new Blob([content], {type:'text/plain'}), {status:200})))
+    .then(() =>
+  {
+    pathChanged(`${name}.txt`);
+    storeLocalChanges();
+    if(dom.title.isContentEditable) // new note
+      createNote(name).querySelector('img').src = `${name}.jpg`;
+    dom.close.click();
+  });
+}
+
+dom.add.onclick = function() {
+  dom.detail.classList.add('shown');
+  dom.content.value = "";
+  dom.content.readOnly = false;
+  dom.title.innerText = "";
+  dom.title.contentEditable = true;
+  dom.title.focus();
+  dom.edit.click();
+}
       
-      const storeChanges = () => {
-        const checkAllSaved = () => {
-          if(Object.keys(modifications).length == 0 && Object.keys(images).length == 0) {
-            statusMessage(null);
+dom.upload.onchange = function(e) {
+  const fr = new FileReader();
+  fr.onload = function() {
+    const img = document.createElement('img');
+    img.onload = function() {
+      const canvas = document.createElement('canvas');
+      const scale = 0.2;
+      canvas.width = img.width * scale;
+      canvas.height = img.height * scale;
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob(blob => {
+        const name = dom.title.innerText;
+        caches.open('shef')
+          .then(cache => cache.put(new Request(`${name}.jpg`), new Response(blob, {status:200})))
+          .then(() =>
+          {
+            pathChanged(`${name}.jpg`);
+            storeLocalChanges();
+            const active = localStorage.getItem('active');
+            // false if new note, in which case this is done on save
+            if(active)
+              document.querySelector(`div[data-name="${active}"] img`).src = `${name}.jpg`;
           }
-        }
-        Object.entries(modifications).forEach(([title,content]) => {
-          fetch(window.location.href + title, {
-            method: 'PUT',
-            headers: {
-              'Content-type': 'text/plain'
-            },
-            body: content
-          }).then(resp => resp.json()).then(resp => {
-            data[title] = content;
-            localStorage.setItem('content', JSON.stringify(data));
-            delete modifications[title];
-            localStorage.setItem('modifications', JSON.stringify(modifications));
-            checkAllSaved();
-          }).catch(error => {
-            console.error(error);
-          });
-        });
-        Object.entries(images).forEach(([title,content]) => {
-          fetch(content).then(res => res.blob()).then(blob => {
-            fetch(window.location.href + title, {
-              method: 'PUT',
-              headers: {
-                'Content-type': 'image/jpeg'
-              },
-              body: new File([blob], title + '.jpg', { type: 'image/jpeg' })
-            }).then(resp => resp.json()).then(resp => {
-              delete images[title];
-              localStorage.setItem('images', JSON.stringify(images));
-              checkAllSaved();
-            }).catch(error => {
-              console.error(error);
-            });
-          }).catch(error => {
-            console.error(error);
-          });
-        });
-      }
-
-      if(Object.keys(modifications).length > 0 || Object.keys(images).length > 0) {
-        statusMessage('Unsynchronized changes');
-        storeChanges();
-      }
-      close.onclick = () => {
-        edit.style.display = 'block';
-        save.style.display = 'none';
-        content.contentEditable = false;
-        title.contentEditable = false;
-        detail.classList.remove('shown');
-        newImage = null;
-      };
-      edit.style.display = allowEdits ? 'block' : 'none';
-      edit.onclick = () => {
-        content.contentEditable = true;
-        edit.style.display = 'none';
-        save.style.display = 'block';
-      };
-      upload.onchange = e => {
-        const fr = new FileReader();
-        fr.onload = () => {
-          const img = document.createElement('img');
-          img.onload = () => {
-            const canvas = document.createElement('canvas');
-            const scale = 0.2;
-            canvas.width = img.width * scale;
-            canvas.height = img.height * scale;
-            canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
-            canvas.toBlob(blob => {
-              newImage = blob;
-              const tx = db.transaction(['images'], 'readwrite');
-              tx.objectStore('images').put(blob, title.innerText);
-              const fr = new FileReader(); // todo try objecturl instead
-              fr.onload = () => {
-                          active.querySelector('img').src = fr.result;
-            newImage = fr.result;
-            edit.style.display = 'none';
-            save.style.display = 'block';
-
-              }
-              fr.readAsDataURL(blob);
-              
-            }, 'image/jpeg');
-          }
-                  img.src = fr.result;
-
-        }
-                      fr.readAsDataURL(e.target.files[0]);
-
-        
-        
-      }
-      image.onclick = () => {
-        upload.click();
-      }
-      save.onclick = () => {
-        modifications[title.innerText] = content.innerText;
-        localStorage.setItem('modifications', JSON.stringify(modifications));
-        if(newImage) {
-          images[title.innerText] = newImage;
-          localStorage.setItem('images', JSON.stringify(images));
-        }
-        statusMessage('Unsynchronized changes');
-        storeChanges();
-        close.click();
-      }
-      add.onclick = () => {
-        detail.classList.add('shown');
-        content.innerHTML = "";
-        title.innerText = "";
-        title.contentEditable = true;
-        title.focus();
-        edit.click();
-      }
-      Object.entries(data).forEach(([name,data]) => {
-        const div = document.createElement('div');
-        div.classList.add('note');
-        if(images.hasOwnProperty(name))
-          div.innerHTML += `<img src="${images[name]}"><span>${name}</span>`;
-        else
-          div.innerHTML += `<img src="${name}.jpg"><span>${name}</span>`;
-        div.onclick = () => {
-          active = div;
-          if(modifications.hasOwnProperty(name))
-            data = modifications[name];
-          content.innerHTML = data;
-          title.innerText = name;
-          detail.classList.add('shown');
-        }
-        notes.appendChild(div);
-      });
+        );
+      }, 'image/jpeg');
     }
-    // get content from server
-    fetch(window.location.href + 'data.json')
-    .then(resp => resp.json()).then(data => {
-      console.log('setup from server');
-      appSetup(data);
-    }).catch(error => {
-      // ? can never happen if serviceworker loaded?
-      statusMessage(error);
-      console.error(error);
-      console.log('setup from localstorage');
-      const data = localStorage.getItem('content');
-      appSetup(data === null ? {} : JSON.parse(data));
-    })
+    img.src = this.result;
   }
- </script>
+  fr.readAsDataURL(e.target.files[0]);
+}
+
+dom.image.onclick = function() {
+  dom.upload.click()
+};
+      
+function createNote(name) {
+  const div = document.createElement('div');
+  div.dataset.name = name;
+  div.classList.add('note');
+  div.innerHTML += `<img src="${name}.jpg"><span dir="auto">${name}</span>`;
+  div.onclick = function() {
+    localStorage.setItem('active', name);
+    dom.title.innerText = name;
+    dom.detail.classList.add('shown');
+    // should be cached
+    fetch(`${name}.txt`).then(resp => resp.text()).then(txt => dom.content.value = txt);
+  }
+  dom.notes.appendChild(div);
+  return div;
+}
+
+// offline support
+navigator.serviceWorker.register("sw.js");
+
+// setup page from list of known notes
+JSON.parse(localStorage.getItem('entries') || '[]').forEach(name => createNote(name));
+
+// load any active page
+const active = localStorage.getItem('active');
+if(active)
+  document.querySelector(`div[data-name="${active}"]`).click();
+
+// sync with server if available
+storeLocalChanges().then(() => checkForServerChanges());
+
+</script>
 </body>
 </html>
 EOF
