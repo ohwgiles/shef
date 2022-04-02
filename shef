@@ -44,13 +44,13 @@ if [[ ! -d .git ]] && ! { git init &> /dev/null && \
   git config user.name shef && \
   git config user.email shef@localhost; }
 then
-  echo "shef: Could not initialize git repository in $PWD" >/dev/stderr
+  echo "shef: Could not initialize git repository in $PWD" >&2
   echo -e 'Status: 500 Server Error\n\n'
   exit
 fi
 
-echo "shef: $REQUEST_METHOD $REQUEST_URI $CONTENT_TYPE" >/dev/stderr
-#env >/dev/stderr
+echo "shef: $REQUEST_METHOD $REQUEST_URI $CONTENT_TYPE" >&2
+#env >&2
 function urldecode() { local v="${*//+/ }"; echo -e "${v//%/\\x}"; }
 shopt -s extglob
 
