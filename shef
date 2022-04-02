@@ -67,22 +67,6 @@ if [[ "$REQUEST_METHOD" == "PUT" ]]; then
   exit
 fi
 
-# Main data request
-if [[ "$REQUEST_URI" == "/data.json" ]]; then
-	# Output all notes in the format
-	# { filename: contents, ... }
-	result='{}'
-	for f in *.txt; do
-		f=${f%%.txt}
-		result=$(jq -s "$result * .[0]" <(jq -s "{\"$f\": .[0]}" <(jq -sR . "$f.txt")));
-	done
-	# To test unreachability:
-	#echo -e "Status: 400 Bad Request\n\n"
-	echo -e 'Status: 200 OK\nContent-type: application/json; charset=utf-8\n\n'
-	echo "$result"
-	exit
-fi
-
 # Application manifest
 if [[ "$REQUEST_URI" == "/manifest.webmanifest" ]]; then
 cat <<\EOF
