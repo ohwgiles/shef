@@ -137,11 +137,11 @@ Content-type: application/json; charset=utf-8
 
 EOF
 (git rev-parse --verify -q --end-of-options "$from" &>/dev/null && \
-  git diff $from..HEAD --summary --name-status | xargs -r printf '%b\t%b\n' |
-   jq -Rn 'reduce (inputs|split("\t")) as $i ({}; .[$i[0]] += [$i[1]])|
+  git diff-tree $from..HEAD --name-status -z |
+   jq -Rn 'reduce (inputs|split("\u0000")|_nwise(2)) as $i ({}; .[$i[0]] += [$i[1]])|
     {"created":(.A//[]),"modified":(.M//[]),"deleted":(.D//[])}' ||
-  git ls-files | xargs -r printf '%b\n' | \
-   jq -Rn '{"created":[inputs],"modified":[],"deleted":[]}') |
+  git ls-files -z | \
+   jq -Rn '{"created":inputs|split("\u0000"),"modified":[],"deleted":[]}') |
 jq "{ \"head\": \"$(git rev-parse --verify -q HEAD)\"} * ."
 exit
 fi
